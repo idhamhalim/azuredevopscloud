@@ -1,5 +1,10 @@
 {
   "OrganizationName": "my-org-name",
   "ProjectName": "MyProject",
-  "Pat": "your_personal_access_token_here"
+  "Pat": "your_personal_access_token_here",
+  "BuildPipelinePatterns": [
+    "BEAUTO-SFCSRV*",
+    "*-CI-Main",
+    "Legacy-System-*"
+  ]
 }
