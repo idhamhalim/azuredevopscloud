@@ -26,17 +26,8 @@
 
 .PARAMETER Pat
     (Optional) Your Personal Access Token (PAT). Overrides values from config.json or the environment variable.
-
-.EXAMPLE
-    # With a complete config.json file in the same directory:
-    PS C:\> .\Move-AzDevOps-Sprint.ps1 -SourceSprintName "Sprint 123" -DestinationSprintName "Sprint 124"
-
-.EXAMPLE
-    # Overriding the project name for a single run:
-    PS C:\> .\Move-AzDevOps-Sprint.ps1 -ProjectName "MyOtherProject" -SourceSprintName "Sprint 123" -DestinationSprintName "Sprint 124"
 #>
 param(
-    # These are now optional, as they can be loaded from the config file.
     [Parameter(Mandatory=$false)]
     [string]$OrganizationName,
 
@@ -53,10 +44,8 @@ param(
     [string]$Pat
 )
 
-# --- Script Initialization & Configuration Loading ---
-
 try {
-    # Define the path to the config file (expected to be in the same directory as the script)
+    # --- Script Initialization & Configuration Loading ---
     $configPath = Join-Path $PSScriptRoot "config.json"
     $config = $null
 
@@ -65,37 +54,25 @@ try {
         $config = Get-Content -Path $configPath -Raw | ConvertFrom-Json
     }
 
-    # Determine final configuration values with overrides
-    # Priority: Command-line parameter > JSON config file > Default/Error
     $org = $OrganizationName -or $config.OrganizationName
     $proj = $ProjectName -or $config.ProjectName
-
-    # For PAT, we add a third fallback to the environment variable
-    # Priority: Command-line parameter > JSON config file > Environment variable > Error
     $token = $Pat -or $config.Pat -or $env:AZDO_PAT
 
-    # Validate that we have all the necessary configuration
-    if (-not $org) { throw "OrganizationName is missing. Provide it via the -OrganizationName parameter or in config.json." }
-    if (-not $proj) { throw "ProjectName is missing. Provide it via the -ProjectName parameter or in config.json." }
-    if (-not $token) { throw "PAT is missing. Provide it via the -Pat parameter, in config.json, or as the AZDO_PAT environment variable." }
+    if (-not $org)   { throw "OrganizationName is missing. Provide it via -OrganizationName or in config.json." }
+    if (-not $proj)  { throw "ProjectName is missing. Provide it via -ProjectName or in config.json." }
+    if (-not $token) { throw "PAT is missing. Provide it via -Pat, in config.json, or AZDO_PAT environment variable." }
 
-    # --- Helper Functions ---
     function Get-AzDevOpsApiUri {
-        param(
-            [string]$CurrentOrg,
-            [string]$CurrentProj,
-            [string]$ApiPath
-        )
+        param($CurrentOrg, $CurrentProj, $ApiPath)
         return "https://dev.azure.com/$CurrentOrg/$CurrentProj/_apis/$ApiPath"
     }
 
     function Get-AuthHeader {
-        param([string]$PersonalAccessToken)
+        param($PersonalAccessToken)
         $base64AuthInfo = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$($PersonalAccessToken)"))
         return @{ Authorization = "Basic $base64AuthInfo" }
     }
 
-    # --- Script Body ---
     Write-Host "Starting script..." -ForegroundColor Cyan
     $headers = Get-AuthHeader -PersonalAccessToken $token
 
@@ -107,10 +84,10 @@ try {
     $sourceSprint = $iterations.value | Where-Object { $_.name -eq $SourceSprintName }
     $destinationSprint = $iterations.value | Where-Object { $_.name -eq $DestinationSprintName }
 
-    if (-not $sourceSprint) { throw "Source sprint '$SourceSprintName' not found." }
+    if (-not $sourceSprint)      { throw "Source sprint '$SourceSprintName' not found." }
     if (-not $destinationSprint) { throw "Destination sprint '$DestinationSprintName' not found." }
 
-    $sourceIterationPath = $sourceSprint.path
+    $sourceIterationPath      = $sourceSprint.path
     $destinationIterationPath = $destinationSprint.path
     Write-Host " -> Source Sprint Path: $sourceIterationPath" -ForegroundColor Green
     Write-Host " -> Destination Sprint Path: $destinationIterationPath" -ForegroundColor Green
@@ -119,7 +96,7 @@ try {
     Write-Host "Querying for unfinished work items in '$SourceSprintName'..."
     $wiqlUri = Get-AzDevOpsApiUri -CurrentOrg $org -CurrentProj $proj -ApiPath "wit/wiql?api-version=7.1-preview.2"
     $wiqlQuery = @{
-        query = "SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = '$proj' AND [System.IterationPath] = '$sourceIterationPath' AND [System.State] <> 'Done' AND [System.State] <> 'Closed' AND [System.State] <> 'Removed'"
+        query = "SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = '$proj' AND [System.IterationPath] = '$sourceIterationPath' AND [System.State] <> 'Done' AND [System.State] <> 'Closed'"
     } | ConvertTo-Json
 
     $queryResult = Invoke-RestMethod -Uri $wiqlUri -Method Post -Headers $headers -Body $wiqlQuery -ContentType "application/json"
@@ -130,18 +107,27 @@ try {
         exit
     }
 
-    $itemCount = $workItems.Count
+    $workItemIds = $workItems | ForEach-Object { $_.id }
+    $itemCount = $workItemIds.Count
     Write-Host "Found $itemCount work item(s) to move." -ForegroundColor Cyan
 
-    # 3. Loop through each work item and update its iteration path
+    # 3. Move work items in batches (up to 200 per batch)
+    $batchSize = 200
     $movedCount = 0
-    foreach ($item in $workItems) {
-        $workItemId = $item.id
-        Write-Host " -> Moving work item ID: $workItemId..."
-        $updateUri = Get-AzDevOpsApiUri -CurrentOrg $org -CurrentProj $proj -ApiPath "wit/workitems/$($workItemId)?api-version=7.1-preview.3"
-        $updateBody = @( @{ op = "add"; path = "/fields/System.IterationPath"; value = $destinationIterationPath } ) | ConvertTo-Json
-        Invoke-RestMethod -Uri $updateUri -Method Patch -Headers $headers -Body $updateBody -ContentType "application/json-patch+json" | Out-Null
-        $movedCount++
+
+    for ($i = 0; $i -lt $itemCount; $i += $batchSize) {
+        $batchIds = $workItemIds[$i..([Math]::Min($i + $batchSize - 1, $itemCount - 1))]
+        foreach ($workItemId in $batchIds) {
+            Write-Host " -> Moving work item ID: $workItemId..."
+            $updateUri = Get-AzDevOpsApiUri -CurrentOrg $org -CurrentProj $proj -ApiPath "wit/workitems/$($workItemId)?api-version=7.1-preview.3"
+            $updateBody = @( @{ op = "add"; path = "/fields/System.IterationPath"; value = $destinationIterationPath } ) | ConvertTo-Json
+            try {
+                Invoke-RestMethod -Uri $updateUri -Method Patch -Headers $headers -Body $updateBody -ContentType "application/json-patch+json" | Out-Null
+                $movedCount++
+            } catch {
+                Write-Warning "Failed to move work item ID: $workItemId"
+            }
+        }
     }
 
     Write-Host "Successfully moved $movedCount work item(s) from '$SourceSprintName' to '$DestinationSprintName'." -ForegroundColor Green
